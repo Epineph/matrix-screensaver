@@ -2,14 +2,16 @@
 """
 matrix_screensaver.py
 
-A simple X11‐idle‐based “screensaver” that loops your captured video.
-– After FIRST_THRESHOLD seconds of idle, play normal.
-– After SECOND_THRESHOLD seconds of continual idle, restart with a rainbow hue filter.
+Idle-based video screensaver:
+- Normal loop after first threshold
+- Rainbow hue filter after second threshold
+
+Usage:
+  matrix_screensaver.py [options]
 
 Dependencies:
-  - python3
-  - python3-xlib   (for XScreenSaverQueryInfo)
-  - ffmpeg         (provides ffplay)
+  - ffplay (from ffmpeg)
+  - xprintidle  # for reliable idle detection
 """
 
 import argparse
@@ -18,28 +20,39 @@ import time
 import signal
 import sys
 
-from Xlib import display
-from Xlib.ext import screensaver
+# Try to import Xlib only as a fallback
+try:
+    from Xlib import display
+    from Xlib.ext import screensaver
+    _have_xlib = True
+except ImportError:
+    _have_xlib = False
 
-def get_idle_ms(disp, root):
+def get_idle_ms():
     """
-    Query the X server for the current idle time in milliseconds.
-    Uses the XScreenSaver extension.
+    Return idle time in milliseconds.
+    First try xprintidle; otherwise fallback to XScreenSaver.
     """
+    # 1) Try xprintidle
+    try:
+        out = subprocess.check_output(['xprintidle'])
+        return int(out)
+    except Exception:
+        pass
+
+    # 2) Fallback to Xlib
+    if not _have_xlib:
+        sys.stderr.write("Error: need xprintidle or python-xlib\n")
+        sys.exit(1)
+    disp = display.Display()
+    root = disp.screen().root
     info = screensaver.QueryInfo(disp, root)
     return info.idle
 
 def start_player(cmd):
-    """
-    Launches ffplay with the given command list.
-    Returns the Popen object so we can terminate it later.
-    """
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def kill_player(proc):
-    """
-    Gracefully terminate the ffplay process.
-    """
     if proc and proc.poll() is None:
         proc.send_signal(signal.SIGINT)
         try:
@@ -47,85 +60,63 @@ def kill_player(proc):
         except subprocess.TimeoutExpired:
             proc.kill()
 
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Idle‐based video screensaver with optional rainbow effect.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  {0} --first-threshold 600 --second-threshold 1800\n"
+            "  {0} --video demo.mp4\n"
+        ).format(__file__)
+    )
+    p.add_argument("-v","--video",         default="capture2.mp4",
+                   help="Path to video file")
+    p.add_argument("--first-threshold",   type=int, default=300,
+                   help="Idle seconds before normal loop (default:300)")
+    p.add_argument("--second-threshold",  type=int, default=3600,
+                   help="Idle seconds before rainbow loop (default:3600)")
+    p.add_argument("--poll-interval",      type=float, default=1.0,
+                   help="Seconds between idle checks")
+    return p.parse_args()
+
 def main():
-    parser = argparse.ArgumentParser(
-        description="Idle‐based video screensaver with optional rainbow effect."
-    )
-    parser.add_argument(
-        "-v", "--video",
-        default="capture2.mp4",
-        help="Path to your captured video file."
-    )
-    parser.add_argument(
-        "--first-threshold",
-        type=int,
-        default=300,
-        help="Seconds of idle before starting the normal loop (default: 300s)."
-    )
-    parser.add_argument(
-        "--second-threshold",
-        type=int,
-        default=3600,
-        help="Seconds of idle before restarting with rainbow filter (default: 3600s)."
-    )
-    parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=1.0,
-        help="How often (in seconds) to poll X idle time."
-    )
-    args = parser.parse_args()
+    args = parse_args()
 
-    # ffplay command lines
     normal_cmd = [
-        "ffplay", "-nodisp",    # no window decorations
-        "-loop", "0",           # infinite loop
-        "-fs",                  # full-screen
-        "-hide_banner", "-loglevel", "quiet",
+        "ffplay","-nodisp","-loop","0","-fs",
+        "-hide_banner","-loglevel","quiet",
         args.video
     ]
-    rainbow_cmd = [
-        "ffplay", "-nodisp",
-        "-loop", "0",
-        "-fs",
-        "-hide_banner", "-loglevel", "quiet",
-        "-vf", "hue=h=2*t:s=2", # hue shift & saturation boost
-        args.video
-    ]
+    rainbow_cmd = normal_cmd + ["-vf","hue=h=2*t:s=2"]
 
-    # Connect to X11
-    disp = display.Display()
-    root = disp.screen().root
-
-    player_proc = None
-    mode = "off"  # off → normal → rainbow
+    player = None
+    mode = "off"
 
     try:
         while True:
-            idle_ms = get_idle_ms(disp, root)
-            idle_s = idle_ms / 1000.0
+            idle_s = get_idle_ms() / 1000.0
 
-            if idle_s >= args.second_threshold:
-                if mode != "rainbow":
-                    kill_player(player_proc)
-                    player_proc = start_player(rainbow_cmd)
-                    mode = "rainbow"
-            elif idle_s >= args.first_threshold:
-                if mode != "normal":
-                    kill_player(player_proc)
-                    player_proc = start_player(normal_cmd)
-                    mode = "normal"
-            else:
-                if mode != "off":
-                    kill_player(player_proc)
-                    player_proc = None
-                    mode = "off"
+            if idle_s >= args.second_threshold and mode != "rainbow":
+                kill_player(player)
+                player = start_player(rainbow_cmd)
+                mode = "rainbow"
+
+            elif idle_s >= args.first_threshold and mode != "normal":
+                kill_player(player)
+                player = start_player(normal_cmd)
+                mode = "normal"
+
+            elif idle_s < args.first_threshold and mode != "off":
+                kill_player(player)
+                player = None
+                mode = "off"
 
             time.sleep(args.poll_interval)
 
     except KeyboardInterrupt:
-        kill_player(player_proc)
+        kill_player(player)
         sys.exit(0)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
